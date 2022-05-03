@@ -1,13 +1,11 @@
 use regex::Regex;
 use reqwest::Response;
-use scraper::Selector;
 use serde::Serialize;
-use std::collections::HashMap;
 
 use crate::{
     structs::special::{BandcampType, TwitchType},
     util::{
-        request::{consume_fragment, consume_size, fetch},
+        request::{consume_size, fetch},
         result::Error,
     },
 };
@@ -17,7 +15,7 @@ use super::{
     special::Special,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct Metadata {
     url: String,
     special: Option<Special>,
@@ -43,104 +41,116 @@ pub struct Metadata {
 
 impl Metadata {
     pub async fn from(resp: Response, url: String) -> Result<Metadata, Error> {
-        let fragment = consume_fragment(resp).await?;
+        let text = resp.text().await.map_err(|_| Error::FailedToConsumeText)?;
+        let mut dom = tl::parse(&text, tl::ParserOptions::default())
+            .map_err(|_| Error::FailedToConsumeText)?;
 
-        let meta_selector = Selector::parse("meta").map_err(|_| Error::MetaSelectionFailed)?;
-        let mut meta = HashMap::new();
-        for el in fragment.select(&meta_selector) {
-            let node = el.value();
+        let mut links = dom
+            .nodes()
+            .into_iter()
+            .filter_map(|node| node.as_tag())
+            .filter(|tag| tag.name() == "link")
+            .filter_map(|tag| {
+                let attributes = tag.attributes();
+                let property = attributes.get("rel").flatten();
+                let content = attributes.get("href").flatten();
+                if let (Some(property), Some(content)) = (property, content) {
+                    Some((property, content))
+                } else {
+                    None
+                }
+            });
 
-            if let (Some(property), Some(content)) = (
-                node.attr("property").or_else(|| node.attr("name")),
-                node.attr("content"),
-            ) {
-                meta.insert(property.to_string(), content.to_string());
+        let url = links
+            .find_map(|(name, value)| {
+                if name.eq("apple-touch-icon") || name.eq("icon") {
+                    Some(value.as_utf8_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(url);
+
+        let nodes = dom
+            .nodes_mut()
+            .into_iter()
+            .filter_map(|node| node.as_tag_mut());
+
+        let meta = nodes.filter(|tag| tag.name() == "meta");
+
+        let props = meta.filter_map(|tag| {
+            let attrs = tag.attributes_mut();
+            attrs
+                .remove_value("property")
+                .or_else(|| attrs.remove_value("name"))
+                .and_then(|name| attrs.remove_value("content").map(|val| (name, val)))
+        });
+
+        let mut metadata = Metadata {
+            url,
+            ..Metadata::default()
+        };
+
+        for (name, value) in props {
+            match name.as_bytes() {
+                b"og:title" | b"twitter:title" | b"title" => {
+                    if metadata.title.is_some() {
+                        continue;
+                    }
+                    metadata.title = Some(value.as_utf8_str().to_string())
+                }
+                b"og:description" | b"twitter:description" | b"description" => {
+                    if metadata.description.is_some() {
+                        continue;
+                    }
+
+                    metadata.description = Some(value.as_utf8_str().to_string())
+                }
+                b"og:image" | b"og:image:secure_url" | b"twitter:image" | b"twitter:image:src" => {
+                    if metadata.image.is_some() {
+                        continue;
+                    }
+                    let image = metadata.image.get_or_insert_with(Default::default);
+                    image.url = value.as_utf8_str().to_string();
+                }
+                b"og:image:width" => {
+                    let image = metadata.image.get_or_insert_with(Default::default);
+                    image.width = value.as_utf8_str().parse().unwrap_or_default();
+                }
+                b"og:image:height" => {
+                    let image = metadata.image.get_or_insert_with(Default::default);
+                    image.height = value.as_utf8_str().parse().unwrap_or_default();
+                }
+                b"og:video" | b"og:video:secure_url" | b"twitter:video" | b"twitter:video:src" => {
+                    if metadata.video.is_some() {
+                        continue;
+                    }
+                    let video = metadata.video.get_or_insert_with(Default::default);
+                    video.url = value.as_utf8_str().to_string();
+                }
+                b"og:video:width" => {
+                    let video = metadata.video.get_or_insert_with(Default::default);
+                    video.width = value.as_utf8_str().parse().unwrap_or_default();
+                }
+                b"og:video:height" => {
+                    let video = metadata.video.get_or_insert_with(Default::default);
+                    video.height = value.as_utf8_str().parse().unwrap_or_default();
+                }
+                b"twitter:card" => {
+                    if value.eq("summary_large_image") {
+                        let image = metadata.image.get_or_insert_with(Default::default);
+                        image.size = ImageSize::Large
+                    }
+                }
+                b"theme-color" => metadata.colour = Some(value.as_utf8_str().to_string()),
+                b"og:type" => metadata.opengraph_type = Some(value.as_utf8_str().to_string()),
+                b"og:site_name" => metadata.site_name = Some(value.as_utf8_str().to_string()),
+                b"og:url" => metadata.url = value.as_utf8_str().to_string(),
+                _ => (),
             }
         }
 
-        let link_selector = Selector::parse("link").map_err(|_| Error::MetaSelectionFailed)?;
-        let mut link = HashMap::new();
-        for el in fragment.select(&link_selector) {
-            let node = el.value();
-
-            if let (Some(property), Some(content)) = (node.attr("rel"), node.attr("href")) {
-                link.insert(property.to_string(), content.to_string());
-            }
-        }
-
-        Ok(Metadata {
-            title: meta
-                .remove("og:title")
-                .or_else(|| meta.remove("twitter:title"))
-                .or_else(|| meta.remove("title")),
-            description: meta
-                .remove("og:description")
-                .or_else(|| meta.remove("twitter:description"))
-                .or_else(|| meta.remove("description")),
-            image: meta
-                .remove("og:image")
-                .or_else(|| meta.remove("og:image:secure_url"))
-                .or_else(|| meta.remove("twitter:image"))
-                .or_else(|| meta.remove("twitter:image:src"))
-                .map(|url| {
-                    let mut size = ImageSize::Preview;
-                    if let Some(card) = meta.remove("twitter:card") {
-                        if &card == "summary_large_image" {
-                            size = ImageSize::Large;
-                        }
-                    }
-
-                    Image {
-                        url,
-                        width: meta
-                            .remove("og:image:width")
-                            .unwrap_or_else(|| "0".to_string())
-                            .parse()
-                            .unwrap_or(0),
-                        height: meta
-                            .remove("og:image:height")
-                            .unwrap_or_else(|| "0".to_string())
-                            .parse()
-                            .unwrap_or(0),
-                        size,
-                    }
-                }),
-            video: meta
-                .remove("og:video")
-                .or_else(|| meta.remove("og:video:url"))
-                .or_else(|| meta.remove("og:video:secure_url"))
-                .map(|url| Video {
-                    url,
-                    width: meta
-                        .remove("og:video:width")
-                        .unwrap_or_else(|| "0".to_string())
-                        .parse()
-                        .unwrap_or(0),
-                    height: meta
-                        .remove("og:video:height")
-                        .unwrap_or_else(|| "0".to_string())
-                        .parse()
-                        .unwrap_or(0),
-                }),
-            icon_url: link
-                .remove("apple-touch-icon")
-                .or_else(|| link.remove("icon"))
-                .map(|mut v| {
-                    // If relative URL, prepend root URL.
-                    if let Some(ch) = v.chars().next() {
-                        if ch == '/' {
-                            v = format!("{}{}", &url, v);
-                        }
-                    }
-
-                    v
-                }),
-            colour: meta.remove("theme-color"),
-            opengraph_type: meta.remove("og:type"),
-            site_name: meta.remove("og:site_name"),
-            url: meta.remove("og:url").unwrap_or(url),
-            special: None,
-        })
+        Ok(metadata)
     }
 
     async fn resolve_image(&mut self) -> Result<(), Error> {

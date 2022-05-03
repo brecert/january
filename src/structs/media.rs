@@ -6,7 +6,13 @@ pub enum ImageSize {
     Preview,
 }
 
-#[derive(Debug, Serialize)]
+impl Default for ImageSize {
+    fn default() -> Self {
+        ImageSize::Preview
+    }
+}
+
+#[derive(Debug, Serialize, Default)]
 pub struct Image {
     pub url: String,
     pub width: isize,
@@ -14,7 +20,7 @@ pub struct Image {
     pub size: ImageSize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct Video {
     pub url: String,
     pub width: isize,

@@ -1,6 +1,5 @@
 use mime::Mime;
 use reqwest::{header::CONTENT_TYPE, Client, Response};
-use scraper::Html;
 
 use super::result::Error;
 
@@ -34,11 +33,6 @@ pub async fn fetch(url: &str) -> Result<(Response, Mime), Error> {
         .parse()
         .map_err(|_| Error::FailedToParseContentType)?;
     Ok((resp, mime))
-}
-
-pub async fn consume_fragment(resp: Response) -> Result<Html, Error> {
-    let body = resp.text().await.map_err(|_| Error::FailedToConsumeText)?;
-    Ok(Html::parse_document(&body))
 }
 
 pub async fn consume_size(resp: Response) -> Result<(isize, isize), Error> {
